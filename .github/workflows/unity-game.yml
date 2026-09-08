@@ -1,0 +1,715 @@
+# Reusable Unity pipeline: test -> build -> deploy to Cloudflare R2.
+#
+# Nothing here is specific to any one game; every per-game value is an input. Games
+# call it as <org>/unity-game-ci/.github/workflows/unity-game.yml@v1. See ADOPTING.md.
+name: Unity Game
+
+on:
+  workflow_call:
+    inputs:
+      game-id:
+        description: 'Short slug for the game. Used for build names and R2 key prefixes.'
+        type: string
+        required: true
+      project-path:
+        description: 'Path to the Unity project root (folder containing Assets/ and ProjectSettings/).'
+        type: string
+        default: '.'
+      unity-version:
+        description: 'Editor version. Empty = read it from ProjectSettings/ProjectVersion.txt.'
+        type: string
+        default: ''
+      build-targets:
+        description: 'JSON array of Unity build targets, e.g. ["WebGL"].'
+        type: string
+        default: '["WebGL"]'
+      build-profile:
+        description: 'Path to a Unity 6 Build Profile .asset, relative to the project root. When set, CI builds through the profile instead of CI.BuildScript.Build.'
+        type: string
+        default: ''
+      test-mode:
+        description: 'all | editmode | playmode | none'
+        type: string
+        default: 'all'
+      coverage-filters:
+        description: 'Coverage assembly filter (e.g. +WorldSim*). Empty disables coverage.'
+        type: string
+        default: ''
+      webgl-compression:
+        description: 'brotli | gzip | disabled. Empty leaves the project/profile setting alone. Ignored when build-profile is set.'
+        type: string
+        default: ''
+      development-build:
+        description: 'Build with the Development flag.'
+        type: boolean
+        default: false
+      deploy:
+        description: 'Upload the WebGL build to R2.'
+        type: boolean
+        default: true
+      r2-bucket:
+        type: string
+        default: ''
+      public-base-url:
+        description: 'Public origin serving the bucket, no trailing slash.'
+        type: string
+        default: ''
+      promote-tags:
+        description: 'On a v* tag, also publish to <game-id>/live/ via the production environment.'
+        type: boolean
+        default: true
+      create-release:
+        description: 'On a v* tag, create a GitHub Release with notes generated from the commits since the previous tag.'
+        type: boolean
+        default: true
+      prune:
+        description: 'Delete objects under the deploy prefix that are not in this build.'
+        type: boolean
+        default: true
+      build-timeout-minutes:
+        description: 'Hang guard for the build job. Cold first builds of a large project can exceed two hours.'
+        type: number
+        default: 180
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      UNITY_LICENSE:
+        description: 'Contents of the .ulf file (Personal licence).'
+        required: false
+      UNITY_EMAIL:
+        required: false
+      UNITY_PASSWORD:
+        required: false
+      UNITY_SERIAL:
+        description: 'Plus/Pro serial. Use instead of UNITY_LICENSE on a paid seat.'
+        required: false
+      R2_ACCOUNT_ID:
+        required: false
+      R2_ACCESS_KEY_ID:
+        required: false
+      R2_SECRET_ACCESS_KEY:
+        required: false
+
+concurrency:
+  group: unity-${{ inputs.game-id }}-${{ github.ref }}
+  # Superseding a PR commit is fine. Cancelling a main/tag build throws away
+  # hours of work and loses the Library cache with it, so let those finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  config:
+    name: Resolve config
+    runs-on: ubuntu-latest
+    outputs:
+      unity-version: ${{ steps.resolve.outputs.unity-version }}
+      version: ${{ steps.resolve.outputs.version }}
+      deploy-prefix: ${{ steps.resolve.outputs.deploy-prefix }}
+      deploy-kind: ${{ steps.resolve.outputs.deploy-kind }}
+      preview-url: ${{ steps.resolve.outputs.preview-url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # version is derived from tags
+
+      - id: resolve
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ inputs.project-path }}
+          UNITY_VERSION_INPUT: ${{ inputs.unity-version }}
+          GAME_ID: ${{ inputs.game-id }}
+          BASE_URL: ${{ inputs.public-base-url }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$UNITY_VERSION_INPUT" ]; then
+            unity_version="$UNITY_VERSION_INPUT"
+          else
+            version_file="$PROJECT_PATH/ProjectSettings/ProjectVersion.txt"
+            if [ ! -f "$version_file" ]; then
+              echo "::error::$version_file not found. Set unity-version or fix project-path."
+              exit 1
+            fi
+            unity_version="$(sed -n 's/^m_EditorVersion: *//p' "$version_file" | tr -d '\r')"
+          fi
+
+          case "$GITHUB_REF" in
+            refs/tags/*)
+              tag="${GITHUB_REF#refs/tags/}"
+              prefix="$GAME_ID/release/$tag"
+              kind=release
+              version="${tag#v}"
+              ;;
+            *)
+              if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+                prefix="$GAME_ID/preview/pr-$PR_NUMBER"
+                kind=preview
+              else
+                slug="$(echo "${GITHUB_REF#refs/heads/}" | tr '/' '-' | tr -cd 'A-Za-z0-9._-')"
+                prefix="$GAME_ID/branch/$slug"
+                kind=branch
+              fi
+              # Plain MAJOR.MINOR.PATCH so Application.version stays a clean x.y.z
+              # that every platform accepts, iOS included. The patch counts commits
+              # since the last tag, so it rises monotonically. The rule that keeps
+              # this honest: tag at or above the number CI last built, never below.
+              # The commit is recorded in the run summary rather than in the version.
+              last_tag="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+              if [ -n "$last_tag" ]; then
+                IFS=. read -r major minor patch <<< "${last_tag#v}"
+                minor="${minor:-0}"; patch="${patch:-0}"; patch="${patch%%[-+]*}"
+                commits="$(git rev-list "$last_tag"..HEAD --count 2>/dev/null || echo 0)"
+                version="$major.$minor.$((patch + commits))"
+              else
+                version="0.1.${GITHUB_RUN_NUMBER}"
+              fi
+              ;;
+          esac
+
+          {
+            echo "unity-version=$unity_version"
+            echo "version=$version"
+            echo "deploy-prefix=$prefix"
+            echo "deploy-kind=$kind"
+            echo "preview-url=${BASE_URL:+$BASE_URL/$prefix/}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### $GAME_ID"
+            echo "- Editor: \`$unity_version\`"
+            echo "- Version: \`$version\` from commit \`${GITHUB_SHA:0:7}\`"
+            echo "- Deploy prefix: \`$prefix\` ($kind)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check R2 credentials
+        # Fail in seconds if a secret or bucket name is wrong, rather than after
+        # a long build has already produced an artifact with nowhere to go.
+        if: inputs.deploy
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          BUCKET: ${{ inputs.r2-bucket }}
+        run: |
+          set -uo pipefail
+          for var in ACCOUNT_ID AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::deploy is on but the R2 secret behind $var is empty."
+              exit 1
+            fi
+          done
+          if [ -z "$BUCKET" ]; then
+            echo "::error::deploy is on but r2-bucket is empty."
+            exit 1
+          fi
+          case "$ACCOUNT_ID" in
+            *.*|*/*)
+              echo "::error::R2_ACCOUNT_ID should be the bare account hash, not the endpoint URL."
+              exit 1 ;;
+          esac
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" \
+                 --endpoint-url "https://${ACCOUNT_ID}.r2.cloudflarestorage.com" 2>/tmp/r2err; then
+            echo "::error::Cannot reach bucket '$BUCKET'. Check the bucket name, the account id, and that the token has Object Read & Write on this bucket."
+            sed 's/^/  /' /tmp/r2err
+            exit 1
+          fi
+          echo "R2 bucket '$BUCKET' reachable."
+
+      - name: Check WebGL delivery settings
+        if: inputs.build-profile != '' && contains(fromJSON(inputs.build-targets), 'WebGL')
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile="${{ inputs.project-path }}/${{ inputs.build-profile }}"
+          if [ ! -f "$profile" ]; then
+            echo "::error::Build profile not found: $profile"
+            exit 1
+          fi
+
+          # These live in the profile's serialised player-settings override block.
+          fmt="$(grep -oE 'webGLCompressionFormat: [0-9]+' "$profile" | tail -n1 | grep -oE '[0-9]+$' || true)"
+          fallback="$(grep -oE 'webGLDecompressionFallback: [0-9]+' "$profile" | tail -n1 | grep -oE '[0-9]+$' || true)"
+          case "${fmt:-}" in
+            0) label=Brotli ;;
+            1) label=Gzip ;;
+            2) label=Disabled ;;
+            *) label='inherited from ProjectSettings' ;;
+          esac
+          echo "- WebGL compression: \`$label\`, decompression fallback: \`${fallback:-inherited}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${fmt:-}" = "2" ]; then
+            echo "::warning::Build profile sets WebGL compression to Disabled. R2 serves what it is given, so players will download the uncompressed build."
+          fi
+          if [ "${fallback:-0}" = "1" ]; then
+            echo "::warning::Build profile has decompression fallback ON. ci/deploy-r2.sh sets Content-Encoding, so the fallback only adds loader weight and masks header problems."
+          fi
+
+  test:
+    name: Tests (${{ inputs.test-mode }})
+    if: inputs.test-mode != 'none'
+    needs: config
+    runs-on: ubuntu-latest
+    # A hung editor otherwise burns GitHub's 6 hour default before anyone notices.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          # The editor image is several GB unpacked; a hosted runner has ~14 GB free,
+          # and docker exits 125 rather than reporting a disk error.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc                       /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ inputs.project-path }}/Library
+          key: Library-test-${{ inputs.game-id }}-${{ hashFiles(format('{0}/Packages/packages-lock.json', inputs.project-path)) }}
+          restore-keys: |
+            Library-test-${{ inputs.game-id }}-
+            Library-${{ inputs.game-id }}-
+
+      - uses: game-ci/unity-test-runner@v4
+        id: tests
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          projectPath: ${{ inputs.project-path }}
+          unityVersion: ${{ needs.config.outputs.unity-version }}
+          testMode: ${{ inputs.test-mode }}
+          artifactsPath: test-results
+          githubToken: ${{ github.token }}
+          checkName: Unity tests (${{ inputs.game-id }})
+          coverageOptions: ${{ inputs.coverage-filters != '' && format('generateAdditionalMetrics;generateHtmlReport;assemblyFilters:{0}', inputs.coverage-filters) || '' }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ inputs.game-id }}
+          path: ${{ steps.tests.outputs.artifactsPath }}
+          retention-days: 14
+          if-no-files-found: ignore
+
+  build:
+    name: Build ${{ matrix.targetPlatform }}
+    needs: [config, test]
+    # The test job is skipped when test-mode is none; only a real failure should block.
+    if: always() && needs.config.result == 'success' && needs.test.result != 'failure'
+    runs-on: ${{ inputs.runs-on }}
+    # Cold first builds are slow; this is a hang guard, not a target.
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        targetPlatform: ${{ fromJSON(inputs.build-targets) }}
+    steps:
+      - name: Prepare runner disk and memory
+        if: startsWith(inputs.runs-on, 'ubuntu')
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The first attempt died after two hours with "runner lost communication":
+          # the OOM killer or a full root disk during the WebGL link.
+          #
+          # Reclaim space by deleting preinstalled toolchains this build never touches.
+          # Do NOT relocate Docker's data-root: that broke the daemon and every
+          # docker run then failed with exit 125 before Unity even started.
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /usr/local/share/chromium /opt/hostedtoolcache \
+                      "${AGENT_TOOLSDIRECTORY:-}" 2>/dev/null || true
+          # Preinstalled images are several GB and none of them are the Unity editor.
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          echo "after:"; df -h /
+
+          # The runner image ships a 4 GB swapfile on /mnt; make it 16 GB so the link
+          # step pages instead of being killed. /mnt has ~60 GB spare.
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile >/dev/null
+          sudo swapon /mnt/swapfile
+          free -h
+
+          # Fail here, in seconds, rather than as a bare exit 125 inside unity-builder.
+          if ! docker run --rm hello-world >/dev/null 2>&1; then
+            echo "::error::Docker cannot start containers; the build would fail with exit 125."
+            sudo systemctl status docker --no-pager | tail -20 || true
+            exit 1
+          fi
+          echo "docker ok"
+
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # restore/save are split so the Library is saved even when the build fails or
+      # times out - otherwise every failed attempt leaves the next one cold again.
+      - uses: actions/cache/restore@v4
+        id: library-cache
+        with:
+          path: ${{ inputs.project-path }}/Library
+          key: Library-${{ inputs.game-id }}-${{ matrix.targetPlatform }}-${{ hashFiles(format('{0}/Packages/packages-lock.json', inputs.project-path)) }}
+          restore-keys: |
+            Library-${{ inputs.game-id }}-${{ matrix.targetPlatform }}-
+            Library-${{ inputs.game-id }}-
+            Library-test-${{ inputs.game-id }}-
+
+      - uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          projectPath: ${{ inputs.project-path }}
+          unityVersion: ${{ needs.config.outputs.unity-version }}
+          targetPlatform: ${{ matrix.targetPlatform }}
+          buildName: ${{ inputs.game-id }}
+          buildsPath: build
+          buildMethod: ${{ inputs.build-profile == '' && 'CI.BuildScript.Build' || '' }}
+          buildProfile: ${{ inputs.build-profile }}
+          versioning: Custom
+          version: ${{ needs.config.outputs.version }}
+          allowDirtyBuild: true
+          customParameters: >-
+            ${{ inputs.webgl-compression != '' && format('-CICompression {0}', inputs.webgl-compression) || '' }}
+            ${{ inputs.development-build && '-CIDevelopmentBuild' || '' }}
+            -CICommit ${{ github.sha }}
+
+      - name: Fix artifact ownership
+        # The container runs as root; the cache and artifact steps run as the runner user.
+        if: always() && startsWith(inputs.runs-on, 'ubuntu')
+        shell: bash
+        run: sudo chown -R "$(id -u):$(id -g)" build "${{ inputs.project-path }}/Library" 2>/dev/null || true
+
+      - name: Save Library cache
+        if: always() && steps.library-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ inputs.project-path }}/Library
+          key: ${{ steps.library-cache.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.game-id }}-${{ matrix.targetPlatform }}
+          path: build/${{ matrix.targetPlatform }}
+          retention-days: 14
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to R2 (${{ needs.config.outputs.deploy-kind }})
+    needs: [config, build]
+    if: inputs.deploy && contains(fromJSON(inputs.build-targets), 'WebGL')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    environment:
+      name: ${{ needs.config.outputs.deploy-kind }}
+      url: ${{ needs.config.outputs.preview-url }}
+    steps:
+      - name: Fetch pipeline scripts
+        uses: actions/checkout@v4
+        with:
+          repository: TheFriedHashbrown/unity-game-ci
+          # Exactly the commit this workflow came from, so the scripts can never be
+          # a version apart from the workflow calling them, whatever ref the caller
+          # pinned. Works for a public repo with the default token.
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-tools
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.game-id }}-WebGL
+          path: dist
+
+      - name: Locate the WebGL build root
+        id: root
+        shell: bash
+        run: |
+          set -euo pipefail
+          index="$(find dist -maxdepth 3 -name index.html | head -n1)"
+          if [ -z "$index" ]; then
+            echo "::error::No index.html in the WebGL artifact."
+            find dist -maxdepth 3 | head -50
+            exit 1
+          fi
+          echo "dir=$(dirname "$index")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to R2
+        shell: bash
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          chmod +x .ci-tools/ci/deploy-r2.sh
+          # Only a release/<tag>/ prefix is never rewritten, so only it may be
+          # cached immutably; Unity reuses the same player filenames every build.
+          .ci-tools/ci/deploy-r2.sh \
+            --source "${{ steps.root.outputs.dir }}" \
+            --bucket "${{ inputs.r2-bucket }}" \
+            --prefix "${{ needs.config.outputs.deploy-prefix }}" \
+            ${{ needs.config.outputs.deploy-kind == 'release' && '--immutable' || '' }} \
+            ${{ inputs.prune && '--prune' || '' }}
+
+      - name: Smoke-test the deployed build
+        if: inputs.public-base-url != ''
+        shell: bash
+        run: |
+          chmod +x .ci-tools/ci/verify-deploy.sh
+          .ci-tools/ci/verify-deploy.sh "${{ needs.config.outputs.preview-url }}"
+
+      - name: Comment the preview link on the PR
+        if: github.event_name == 'pull_request' && inputs.public-base-url != ''
+        uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ needs.config.outputs.preview-url }}
+          GAME_ID: ${{ inputs.game-id }}
+        with:
+          script: |
+            const marker = `<!-- unity-preview:${process.env.GAME_ID} -->`;
+            const body = [
+              marker,
+              `### \`${process.env.GAME_ID}\` preview build`,
+              ``,
+              `**${process.env.PREVIEW_URL}**`,
+              ``,
+              `Commit \`${context.sha.slice(0, 7)}\` — updated ${new Date().toISOString()}`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  promote:
+    name: Promote to live
+    needs: [config, build, deploy]
+    if: >-
+      inputs.deploy && inputs.promote-tags
+      && needs.config.outputs.deploy-kind == 'release'
+      && contains(fromJSON(inputs.build-targets), 'WebGL')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      # R2 has no directory index, so the file has to be named explicitly.
+      url: ${{ inputs.public-base-url }}/${{ inputs.game-id }}/live/index.html
+    steps:
+      - name: Fetch pipeline scripts
+        uses: actions/checkout@v4
+        with:
+          repository: TheFriedHashbrown/unity-game-ci
+          # Exactly the commit this workflow came from, so the scripts can never be
+          # a version apart from the workflow calling them, whatever ref the caller
+          # pinned. Works for a public repo with the default token.
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-tools
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.game-id }}-WebGL
+          path: dist
+
+      - name: Publish to <game>/live/
+        shell: bash
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          index="$(find dist -maxdepth 3 -name index.html | head -n1)"
+          root="$(dirname "$index")"
+
+          # Record which release this is, so the rollback workflow can answer
+          # "what is live?" and therefore "what came before it?". Written into the
+          # build folder rather than uploaded separately, so --prune leaves it be.
+          cat > "$root/deployed.json" <<JSON
+          {
+            "tag": "${GITHUB_REF#refs/tags/}",
+            "commit": "${GITHUB_SHA}",
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "run": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          }
+          JSON
+
+          chmod +x .ci-tools/ci/deploy-r2.sh
+          # No --immutable: live/ is rewritten on every promotion and rollback.
+          .ci-tools/ci/deploy-r2.sh \
+            --source "$root" \
+            --bucket "${{ inputs.r2-bucket }}" \
+            --prefix "${{ inputs.game-id }}/live" \
+            --prune
+
+  release:
+    name: GitHub Release
+    needs: [config, build, deploy]
+    # deploy is skipped when a game has deploy off, which should not block a release.
+    if: >-
+      always() && inputs.create-release
+      && needs.config.outputs.deploy-kind == 'release'
+      && needs.build.result == 'success'
+      && needs.deploy.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # notes are generated from history between tags
+
+      - name: Fetch pipeline scripts
+        uses: actions/checkout@v4
+        with:
+          repository: TheFriedHashbrown/unity-game-ci
+          # Exactly the commit this workflow came from, so the scripts can never be
+          # a version apart from the workflow calling them, whatever ref the caller
+          # pinned. Works for a public repo with the default token.
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-tools
+
+      - name: Update CHANGELOG.md on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          chmod +x .ci-tools/ci/changelog.sh
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # A tag build starts on a detached HEAD, so move onto main to commit there.
+          # Each attempt re-derives the file from whatever main currently is, which
+          # means a push that loses a race is retried cleanly rather than rebased:
+          # the generator is idempotent, so there is nothing to merge.
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+
+            .ci-tools/ci/changelog.sh --output CHANGELOG.md
+
+            if git diff --quiet -- CHANGELOG.md; then
+              echo "CHANGELOG.md already up to date."
+              break
+            fi
+
+            git add CHANGELOG.md
+            git commit -q -m "Update CHANGELOG for $tag"
+
+            # A push made with the built-in token does not trigger workflows, and
+            # markdown is in paths-ignore anyway, so this cannot cause a build loop.
+            if git push -q origin HEAD:main; then
+              echo "CHANGELOG.md updated on main (attempt $attempt)."
+              break
+            fi
+
+            echo "main moved while this ran; retrying ($attempt)."
+            if [ "$attempt" = "3" ]; then
+              echo "::warning::Could not push CHANGELOG.md after 3 attempts. The release itself is unaffected; rerun this job, or run ci/changelog.sh from the pipeline repo against a clone of this one."
+            fi
+          done
+
+      - uses: actions/download-artifact@v4
+        if: contains(fromJSON(inputs.build-targets), 'WebGL')
+        with:
+          name: ${{ inputs.game-id }}-WebGL
+          path: dist
+
+      - name: Package the player for the release
+        if: contains(fromJSON(inputs.build-targets), 'WebGL')
+        id: package
+        shell: bash
+        env:
+          GAME_ID: ${{ inputs.game-id }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+
+          index="$(find dist -maxdepth 3 -name index.html | head -n1)"
+          if [ -z "$index" ]; then
+            echo "::error::No index.html in the WebGL artifact."
+            exit 1
+          fi
+
+          # Zip from inside the build root so index.html sits at the archive root;
+          # the rollback workflow unzips and deploys the result directly.
+          asset="${GAME_ID}-${tag}-webgl.zip"
+          (cd "$(dirname "$index")" && zip -qr "${GITHUB_WORKSPACE}/${asset}" .)
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          ls -lh "$asset" | awk '{print "packaged " $9 " (" $5 ")"}'
+
+      - name: Publish the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME_ID: ${{ inputs.game-id }}
+          BASE_URL: ${{ inputs.public-base-url }}
+          PROMOTED: ${{ inputs.deploy && inputs.promote-tags }}
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+
+          # Take this tag's section straight out of the changelog, so the file and
+          # the release can never disagree about what shipped.
+          {
+            awk -v header="## ${tag} " '
+              index($0, header) == 1 { inside = 1; next }
+              inside && /^## / { exit }
+              inside { print }
+            ' CHANGELOG.md
+
+            if [ -n "$BASE_URL" ]; then
+              echo "## Play this build"
+              echo
+              echo "- [This release](${BASE_URL}/${GAME_ID}/release/${tag}/index.html)"
+              if [ "$PROMOTED" = "true" ]; then
+                echo "- [Current live build](${BASE_URL}/${GAME_ID}/live/index.html)"
+              fi
+            fi
+          } > notes.md
+
+          echo "--- notes.md ---"; cat notes.md; echo "---"
+
+          # Re-running a tag build should update the release, not fail on a duplicate.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --notes-file notes.md --title "$GAME_ID $tag"
+            echo "Updated existing release $tag"
+          else
+            gh release create "$tag" --notes-file notes.md --title "$GAME_ID $tag"
+            echo "Created release $tag"
+          fi
+
+          # The asset is what rollback restores from, and unlike a build artifact
+          # it never expires. --clobber so re-running a tag replaces it cleanly.
+          if [ -n "${ASSET:-}" ] && [ -f "$ASSET" ]; then
+            gh release upload "$tag" "$ASSET" --clobber
+            echo "Attached $ASSET"
+          fi

@@ -1,0 +1,44 @@
+# Reusable: delete a PR's preview build from R2 when the PR closes, so preview/
+# does not grow forever.
+name: Cleanup preview
+
+on:
+  workflow_call:
+    inputs:
+      game-id:
+        type: string
+        required: true
+      r2-bucket:
+        type: string
+        required: true
+    secrets:
+      R2_ACCOUNT_ID:
+        required: true
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+
+jobs:
+  cleanup:
+    name: Remove preview/pr-${{ github.event.number }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Delete objects
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -euo pipefail
+          prefix="${{ inputs.game-id }}/preview/pr-${{ github.event.number }}/"
+          aws s3 rm "s3://${{ inputs.r2-bucket }}/$prefix" \
+            --recursive \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --only-show-errors
+          echo "Removed s3://${{ inputs.r2-bucket }}/$prefix"

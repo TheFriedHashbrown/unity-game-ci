@@ -1,0 +1,13 @@
+name: Cleanup preview
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  cleanup:
+    uses: TheFriedHashbrown/unity-game-ci/.github/workflows/cleanup-preview.yml@v1
+    with:
+      game-id: your-game
+      r2-bucket: games
+    secrets: inherit

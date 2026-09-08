@@ -1,0 +1,25 @@
+# Manual rollback of the live World Sim build.
+#
+# Actions -> Rollback -> Run workflow. Leave the tag empty to go back one release.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to make live (e.g. v0.1.0). Empty = the release before the current one.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    uses: TheFriedHashbrown/unity-game-ci/.github/workflows/rollback.yml@v1
+    with:
+      game-id: your-game
+      r2-bucket: games
+      public-base-url: https://games.example.com
+      tag: ${{ inputs.tag }}
+    secrets: inherit

@@ -1,0 +1,39 @@
+# Example caller. Copy into a game repo as .github/workflows/ci.yml and edit the
+# `with:` block. The pipeline itself lives in unity-game-ci; this file is only
+# this game's configuration.
+name: CI
+
+on:
+  pull_request:
+    paths-ignore: ['**.md']
+  push:
+    branches: [main]
+    tags: ['v*']
+    # Docs-only commits should not cost a full Unity build.
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+# A called workflow cannot grant itself more than the caller has: the test job
+# publishes a check run, the deploy job posts the preview comment, and the
+# release job creates a GitHub Release on v* tags.
+permissions:
+  contents: write
+  checks: write
+  pull-requests: write
+
+jobs:
+  unity:
+    uses: TheFriedHashbrown/unity-game-ci/.github/workflows/unity-game.yml@v1
+    with:
+      game-id: your-game
+      build-targets: '["WebGL"]'
+      # Build through the Unity 6 profile so CI and local builds cannot drift apart.
+      build-profile: 'Assets/Settings/Build Profiles/Web - Release.asset'
+      test-mode: all
+      development-build: ${{ github.event_name == 'pull_request' }}
+      deploy: true
+      r2-bucket: games
+      # r2.dev public development URL. Cloudflare rate-limits it and advises against
+      # production traffic, so swap in a custom domain before players see this.
+      public-base-url: https://games.example.com
+    secrets: inherit

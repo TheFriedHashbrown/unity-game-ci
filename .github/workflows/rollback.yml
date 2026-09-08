@@ -1,0 +1,187 @@
+# Reusable: put a previously released build back on <game>/live/.
+#
+# The build is taken from the GitHub Release asset rather than copied inside R2.
+# That is deliberate: an S3 server-side copy also copies object metadata, and a
+# release object carries `Cache-Control: immutable`, which is correct under
+# release/<tag>/ and actively harmful on live/. Re-deploying through
+# ci/deploy-r2.sh sets every header from scratch, using the one code path that is
+# already proven. It also means rollback survives losing the R2 bucket.
+name: Rollback
+
+on:
+  workflow_call:
+    inputs:
+      game-id:
+        type: string
+        required: true
+      r2-bucket:
+        type: string
+        required: true
+      public-base-url:
+        type: string
+        default: ''
+      tag:
+        description: 'Release tag to make live. Empty means the release before the current one.'
+        type: string
+        default: ''
+    secrets:
+      R2_ACCOUNT_ID:
+        required: true
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+
+concurrency:
+  # Never let a rollback and a promotion write live/ at the same time.
+  group: unity-live-${{ inputs.game-id }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.game-id }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: production
+      url: ${{ inputs.public-base-url }}/${{ inputs.game-id }}/live/index.html
+    steps:
+      - name: Fetch pipeline scripts
+        uses: actions/checkout@v4
+        with:
+          repository: TheFriedHashbrown/unity-game-ci
+          # Exactly the commit this workflow came from, so the scripts can never be
+          # a version apart from the workflow calling them, whatever ref the caller
+          # pinned. Works for a public repo with the default token.
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-tools
+
+      - name: Work out which release to restore
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          BUCKET: ${{ inputs.r2-bucket }}
+          GAME_ID: ${{ inputs.game-id }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -uo pipefail
+          endpoint="https://${ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          # Read the marker the promote job leaves behind, over the S3 API rather
+          # than the public URL so no CDN cache can answer with a stale one.
+          current=""
+          if aws s3 cp "s3://${BUCKET}/${GAME_ID}/live/deployed.json" /tmp/deployed.json \
+               --endpoint-url "$endpoint" --only-show-errors 2>/dev/null; then
+            current="$(python3 -c "import json;print(json.load(open('/tmp/deployed.json')).get('tag',''))" 2>/dev/null || true)"
+            echo "Currently live: ${current:-unknown}"
+          else
+            echo "No deployed.json under ${GAME_ID}/live/ (nothing promoted since markers were added)."
+          fi
+
+          if [ -n "$REQUESTED" ]; then
+            target="$REQUESTED"
+            echo "Restoring the requested tag: $target"
+          else
+            if [ -z "$current" ]; then
+              echo "::error::Cannot work out what is live, so 'the previous release' is undefined. Re-run this workflow with an explicit tag."
+              exit 1
+            fi
+            # Releases newest-first; take the first one that is not the current.
+            target="$(gh release list --limit 100 --json tagName --jq '.[].tagName' \
+                      | grep -v "^${current}$" | head -n1)"
+            if [ -z "$target" ]; then
+              echo "::error::No release older than $current to roll back to."
+              exit 1
+            fi
+            echo "Rolling back from $current to $target"
+          fi
+
+          if ! gh release view "$target" >/dev/null 2>&1; then
+            echo "::error::No GitHub Release named $target."
+            exit 1
+          fi
+
+          echo "tag=$target" >> "$GITHUB_OUTPUT"
+          echo "previous=$current" >> "$GITHUB_OUTPUT"
+
+      - name: Download that release's player
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if ! gh release download "$TAG" --pattern '*-webgl.zip' --dir . 2>/dev/null; then
+            echo "::error::Release $TAG has no *-webgl.zip asset. Releases created before"
+            echo "::error::rollback support was added do not have one; pick a newer tag, or"
+            echo "::error::attach a zip to that release by hand."
+            exit 1
+          fi
+          unzip -q -o ./*-webgl.zip -d dist
+          if [ ! -f dist/index.html ]; then
+            echo "::error::The asset did not contain index.html at its root."
+            find dist -maxdepth 2 | head -20
+            exit 1
+          fi
+          echo "Restored $(find dist -type f | wc -l) files from $TAG"
+
+      - name: Publish to live
+        shell: bash
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TAG: ${{ steps.target.outputs.tag }}
+          PREVIOUS: ${{ steps.target.outputs.previous }}
+        run: |
+          set -euo pipefail
+
+          # Record what is live and why, so the next rollback can reason about it.
+          cat > dist/deployed.json <<JSON
+          {
+            "tag": "${TAG}",
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "rolled_back_from": "${PREVIOUS}",
+            "run": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          }
+          JSON
+
+          chmod +x .ci-tools/ci/deploy-r2.sh
+          # No --immutable: live/ is rewritten, so its files must revalidate.
+          .ci-tools/ci/deploy-r2.sh \
+            --source dist \
+            --bucket "${{ inputs.r2-bucket }}" \
+            --prefix "${{ inputs.game-id }}/live" \
+            --prune
+
+      - name: Verify what is now live
+        if: inputs.public-base-url != ''
+        shell: bash
+        run: |
+          chmod +x .ci-tools/ci/verify-deploy.sh
+          .ci-tools/ci/verify-deploy.sh "${{ inputs.public-base-url }}/${{ inputs.game-id }}/live/"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          PREVIOUS: ${{ steps.target.outputs.previous }}
+        run: |
+          {
+            echo "### Rollback"
+            echo "- Was live: \`${PREVIOUS:-unknown}\`"
+            echo "- Now live: \`${TAG}\`"
+            echo
+            echo "\`live/\` still contains the bad commit's code in git."
+            echo "Revert it on \`main\` so the next release does not reintroduce it."
+          } >> "$GITHUB_STEP_SUMMARY"
