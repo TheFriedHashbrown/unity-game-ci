@@ -6,6 +6,7 @@ with PR previews, tagged releases, generated changelogs, and one-click rollback.
 A game adopts it by adding three small caller files. Everything else lives here.
 
 **Setting it up on a game? Start with [ADOPTING.md](ADOPTING.md).**
+**Already running and want to know how it behaves? See [OPERATING.md](OPERATING.md).**
 
 ```yaml
 # .github/workflows/ci.yml in the game repo
