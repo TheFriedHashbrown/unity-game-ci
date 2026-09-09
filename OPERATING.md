@@ -168,7 +168,7 @@ ci/changelog.sh
 | `No space left on device` | WebGL and IL2CPP on a hosted runner. The prepare step frees ~25 GB and adds swap; past that use a self-hosted runner via `runs-on`. |
 | `The hosted runner lost communication with the server` | The runner process died: OOM killer during the WebGL link, or a full disk. Same fixes. |
 | `License is not activated` | Missing or expired Unity secrets. |
-| `TimeStamp validation failed`, then exit 1 with no Unity output at all | The `UNITY_LICENSE` `.ulf` has gone stale. Run the **Unity activation** workflow and refresh the secret. See below. |
+| `TimeStamp validation failed`, then exit 1 with no Unity output at all | The `UNITY_LICENSE` `.ulf` has gone stale. Refresh it: see *Refreshing the Unity licence* below. |
 | PlayMode tests fail only in CI | CI runs `-nographics`; guard rendering-dependent assertions or move them to EditMode. |
 | Players stuck on an old build | A mutable prefix was cached immutably. Should not happen now, but a hard refresh clears it. |
 | First run is very slow | Cold `Library/` cache. Later runs on the same target reuse it. |
