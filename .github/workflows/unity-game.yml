@@ -27,6 +27,14 @@ on:
         description: 'Path to a Unity 6 Build Profile .asset, relative to the project root. When set, CI builds through the profile instead of CI.BuildScript.Build.'
         type: string
         default: ''
+      build-mode:
+        description: 'gameci: GameCI Docker image on a hosted runner, needs a Unity licence secret. native: the Unity install on a self-hosted runner, using that machine own activation.'
+        type: string
+        default: 'gameci'
+      unity-editor-path:
+        description: 'native mode only. Path to Unity.exe, where {version} is replaced with the resolved editor version.'
+        type: string
+        default: 'C:\Program Files\Unity\Hub\Editor\{version}\Editor\Unity.exe'
       test-mode:
         description: 'all | editmode | playmode | none'
         type: string
@@ -254,7 +262,8 @@ jobs:
     name: Tests (${{ inputs.test-mode }})
     if: inputs.test-mode != 'none'
     needs: config
-    runs-on: ubuntu-latest
+    # Native mode tests on the same self-hosted machine that builds.
+    runs-on: ${{ inputs.build-mode == 'native' && inputs.runs-on || 'ubuntu-latest' }}
     # A hung editor otherwise burns GitHub's 6 hour default before anyone notices.
     timeout-minutes: 60
     permissions:
@@ -262,6 +271,7 @@ jobs:
       checks: write
     steps:
       - name: Free disk space
+        if: inputs.build-mode == 'gameci'
         shell: bash
         run: |
           # The editor image is several GB unpacked; a hosted runner has ~14 GB free,
@@ -272,8 +282,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: true
+          # A self-hosted runner keeps Library/ between runs; a clean checkout deletes it.
+          clean: ${{ inputs.build-mode != 'native' }}
 
       - uses: actions/cache@v4
+        if: inputs.build-mode == 'gameci'
         with:
           path: ${{ inputs.project-path }}/Library
           key: Library-test-${{ inputs.game-id }}-${{ hashFiles(format('{0}/Packages/packages-lock.json', inputs.project-path)) }}
@@ -282,6 +295,7 @@ jobs:
             Library-${{ inputs.game-id }}-
 
       - uses: game-ci/unity-test-runner@v4
+        if: inputs.build-mode == 'gameci'
         id: tests
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
@@ -296,6 +310,63 @@ jobs:
           githubToken: ${{ github.token }}
           checkName: Unity tests (${{ inputs.game-id }})
           coverageOptions: ${{ inputs.coverage-filters != '' && format('generateAdditionalMetrics;generateHtmlReport;assemblyFilters:{0}', inputs.coverage-filters) || '' }}
+
+      - name: Run tests with the installed editor (native)
+        if: inputs.build-mode == 'native'
+        shell: powershell
+        env:
+          UNITY_EDITOR_PATH: ${{ inputs.unity-editor-path }}
+          UNITY_VERSION: ${{ needs.config.outputs.unity-version }}
+          PROJECT_PATH: ${{ inputs.project-path }}
+          TEST_MODE: ${{ inputs.test-mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unity = $env:UNITY_EDITOR_PATH.Replace('{version}', $env:UNITY_VERSION)
+          if (-not (Test-Path $unity)) { Write-Host "::error::Unity not found at $unity"; exit 1 }
+          $project = (Resolve-Path $env:PROJECT_PATH).Path
+          $results = Join-Path $env:GITHUB_WORKSPACE 'test-results'
+          if (Test-Path $results) { Remove-Item -Recurse -Force $results }
+          New-Item -ItemType Directory -Force $results | Out-Null
+
+          $platforms = @()
+          if ($env:TEST_MODE -eq 'all' -or $env:TEST_MODE -eq 'editmode') { $platforms += 'EditMode' }
+          if ($env:TEST_MODE -eq 'all' -or $env:TEST_MODE -eq 'playmode') { $platforms += 'PlayMode' }
+
+          Add-Content -Encoding utf8 -Path $env:GITHUB_STEP_SUMMARY -Value '### Unity tests'
+          $failed = 0
+          foreach ($platform in $platforms) {
+            $xml = Join-Path $results "$platform.xml"
+            $log = Join-Path $results "$platform.log"
+            # -quit must not be combined with -runTests; the editor exits when the run ends.
+            $unityArgs = @('-batchmode', '-runTests',
+                           '-projectPath', "`"$project`"",
+                           '-testPlatform', $platform,
+                           '-testResults', "`"$xml`"",
+                           '-logFile', "`"$log`"")
+            Write-Host "Running $platform tests..."
+            # Not -Wait: that waits for the whole process tree, and Unity leaves its
+            # licensing client running after the editor exits.
+            $p = Start-Process -FilePath $unity -ArgumentList $unityArgs -PassThru -NoNewWindow
+            $null = $p.Handle   # cache the handle so ExitCode is populated after exit
+            $p.WaitForExit()
+            $code = $p.ExitCode
+
+            if (Test-Path $xml) {
+              [xml]$doc = Get-Content $xml
+              $run = $doc.'test-run'
+              $line = "- ${platform}: $($run.passed) passed, $($run.failed) failed, $($run.skipped) skipped (exit $code)"
+            } else {
+              $line = "- ${platform}: no results file written (exit $code)"
+            }
+            Write-Host $line
+            Add-Content -Encoding utf8 -Path $env:GITHUB_STEP_SUMMARY -Value $line
+
+            if ($code -ne 0) {
+              $failed++
+              if (Test-Path $log) { Write-Host "--- last 60 lines of $platform.log ---"; Get-Content $log -Tail 60 }
+            }
+          }
+          if ($failed -gt 0) { Write-Host "::error::$failed test platform(s) failed"; exit 1 }
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -322,7 +393,7 @@ jobs:
         targetPlatform: ${{ fromJSON(inputs.build-targets) }}
     steps:
       - name: Prepare runner disk and memory
-        if: startsWith(inputs.runs-on, 'ubuntu')
+        if: inputs.build-mode == 'gameci' && startsWith(inputs.runs-on, 'ubuntu')
         shell: bash
         run: |
           set -uo pipefail
@@ -363,10 +434,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: true
+          # A self-hosted runner keeps Library/ between runs; a clean checkout deletes it.
+          clean: ${{ inputs.build-mode != 'native' }}
 
       # restore/save are split so the Library is saved even when the build fails or
       # times out - otherwise every failed attempt leaves the next one cold again.
       - uses: actions/cache/restore@v4
+        if: inputs.build-mode == 'gameci'
         id: library-cache
         with:
           path: ${{ inputs.project-path }}/Library
@@ -377,6 +451,7 @@ jobs:
             Library-test-${{ inputs.game-id }}-
 
       - uses: game-ci/unity-builder@v4
+        if: inputs.build-mode == 'gameci'
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
@@ -398,14 +473,71 @@ jobs:
             ${{ inputs.development-build && '-CIDevelopmentBuild' || '' }}
             -CICommit ${{ github.sha }}
 
+      - name: Build with the installed editor (native)
+        if: inputs.build-mode == 'native'
+        shell: powershell
+        env:
+          UNITY_EDITOR_PATH: ${{ inputs.unity-editor-path }}
+          UNITY_VERSION: ${{ needs.config.outputs.unity-version }}
+          PROJECT_PATH: ${{ inputs.project-path }}
+          TARGET: ${{ matrix.targetPlatform }}
+          GAME_ID: ${{ inputs.game-id }}
+          BUILD_VERSION: ${{ needs.config.outputs.version }}
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+          COMPRESSION: ${{ inputs.webgl-compression }}
+          DEVELOPMENT: ${{ inputs.development-build }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unity = $env:UNITY_EDITOR_PATH.Replace('{version}', $env:UNITY_VERSION)
+          if (-not (Test-Path $unity)) { Write-Host "::error::Unity not found at $unity"; exit 1 }
+          $project = (Resolve-Path $env:PROJECT_PATH).Path
+
+          # Same layout unity-builder produces, so deploy needs no special casing.
+          $out = Join-Path $env:GITHUB_WORKSPACE "build\$($env:TARGET)\$($env:GAME_ID)"
+          $location = $out
+          if ($env:TARGET -like 'StandaloneWindows*') { $location = Join-Path $out "$($env:GAME_ID).exe" }
+          $log = Join-Path $env:GITHUB_WORKSPACE "build\unity-$($env:TARGET).log"
+          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+          New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
+
+          # Only this runner opens this project copy, so a lockfile can only be
+          # left over from a cancelled run.
+          $lock = Join-Path $project 'Temp\UnityLockfile'
+          if (Test-Path $lock) { Remove-Item -Force $lock }
+
+          $unityArgs = @('-batchmode', '-nographics', '-quit',
+                         '-projectPath', "`"$project`"",
+                         '-buildTarget', $env:TARGET,
+                         '-executeMethod', 'CI.BuildScript.Build',
+                         '-customBuildPath', "`"$location`"",
+                         '-CIBuildVersion', $env:BUILD_VERSION,
+                         '-CICommit', $env:COMMIT,
+                         '-logFile', "`"$log`"")
+          if ($env:BUILD_PROFILE) { $unityArgs += @('-CIBuildProfile', "`"$($env:BUILD_PROFILE)`"") }
+          if ($env:COMPRESSION) { $unityArgs += @('-CICompression', $env:COMPRESSION) }
+          if ($env:DEVELOPMENT -eq 'true') { $unityArgs += '-CIDevelopmentBuild' }
+
+          Write-Host "Building $($env:TARGET) with $unity"
+          Write-Host "Output: $location"
+          $p = Start-Process -FilePath $unity -ArgumentList $unityArgs -PassThru -NoNewWindow
+          $null = $p.Handle
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) {
+            Write-Host "::error::Unity exited with code $($p.ExitCode)"
+            if (Test-Path $log) { Write-Host '--- last 150 lines of the editor log ---'; Get-Content $log -Tail 150 }
+            exit $p.ExitCode
+          }
+          Get-Content $log | Select-String '\[CI\]' | ForEach-Object { $_.Line }
+
       - name: Fix artifact ownership
         # The container runs as root; the cache and artifact steps run as the runner user.
-        if: always() && startsWith(inputs.runs-on, 'ubuntu')
+        if: always() && inputs.build-mode == 'gameci' && startsWith(inputs.runs-on, 'ubuntu')
         shell: bash
         run: sudo chown -R "$(id -u):$(id -g)" build "${{ inputs.project-path }}/Library" 2>/dev/null || true
 
       - name: Save Library cache
-        if: always() && steps.library-cache.outputs.cache-hit != 'true'
+        if: always() && inputs.build-mode == 'gameci' && steps.library-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ inputs.project-path }}/Library
