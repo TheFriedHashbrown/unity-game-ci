@@ -115,11 +115,30 @@ Unclassified error occured while trying to activate license.
 From the outside this is a bare `exit code 1`, which looks like a broken test rather than
 a licensing problem. The give-away is the absence of any Unity output.
 
-To fix it: run the **Unity activation** workflow in the game repo, download the
-`unity-activation-file` artifact, upload the `.alf` at
-<https://license.unity3d.com/manual>, and paste the returned `.ulf` into `UNITY_LICENSE`.
-Generating the request inside CI rather than exporting from a machine is what keeps it
-valid.
+There is **no CI-side activation**: GameCI retired `unity-request-activation-file`, and it
+now fails with "This action is no longer supported". The process is local.
+
+1. Close the Unity editor.
+2. Generate an activation request, which writes `Unity_v<version>.alf` into the working
+   directory:
+
+   ```bash
+   "/c/Program Files/Unity/Hub/Editor/<version>/Editor/Unity.exe" \
+     -batchmode -nographics -quit -createManualActivationFile -logFile -
+   ```
+
+3. Upload the `.alf` at <https://license.unity3d.com/manual>, choosing Unity Personal and
+   "I don't use Unity in a professional capacity".
+4. Paste the **entire** `.ulf` you get back into the `UNITY_LICENSE` secret.
+5. Re-run the failed job.
+
+GameCI's own documentation tells you to copy `C:\ProgramData\Unity\Unity_lic.ulf`. On
+Unity 6 that file usually does not exist: the normal licence is an entitlement XML under
+`%LOCALAPPDATA%\Unity\licenses`, and a `.ulf` only appears once a manual activation like
+the above creates one.
+
+An activation file is single use, and the resulting `.ulf` is bound to the machine that
+generated it.
 
 ## Running the pieces locally
 
