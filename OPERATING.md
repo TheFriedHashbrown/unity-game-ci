@@ -99,7 +99,53 @@ filenames on every build, so marking them immutable under a rewritten prefix pin
 returning players to whichever build they loaded first, for a year, while `index.html`
 updates around them.
 
+## Build modes
+
+`build-mode` decides where Unity actually runs.
+
+| Mode | Runs where | Licence |
+|---|---|---|
+| `gameci` (default) | GameCI Docker image on a hosted runner | Needs `UNITY_LICENSE` or `UNITY_SERIAL` |
+| `native` | The Unity install on a self-hosted runner | Uses that machine's own activation; no secret |
+
+**Unity Personal can no longer activate in a container.** Manual `.ulf` activation has been
+withdrawn for Personal, and there is no serial, so `gameci` mode effectively requires a
+Plus or Pro seat. `native` mode sidesteps this by using a machine Unity Hub has licensed.
+
+Native mode also avoids the hosted runner's memory and disk limits, which a large WebGL
+project can exhaust outright, and keeps `Library/` warm between runs so builds take 10-20
+minutes rather than hours. It costs no Actions minutes.
+
+The trade: the machine must be on for queued jobs to run, and workflow code executes on it
+with that user's permissions. Fine for a private repo with trusted collaborators; never
+attach a self-hosted runner to a public repo.
+
+Only test and build move. `config`, `deploy`, `promote` and `release` stay on hosted
+runners, costing a minute or two of quota and keeping R2 uploads off the machine.
+
+### Setting up the runner
+
+1. **Settings, Actions, Runners, New self-hosted runner**, pick Windows x64, and run the
+   download and configure commands it shows, in a folder such as `C:\actions-runner`.
+2. When `config.cmd` asks for labels, enter the one you will put in `runs-on`, for example
+   `unity-win`. Keep the default work folder.
+3. Say no to running as a service the first time and start it with `run.cmd`, so you can
+   watch the first run. Once it is green, `config.cmd remove` and reconfigure as a service
+   under your own user account: Unity needs a real user profile, and PlayMode tests need a
+   display.
+4. In the game's `ci.yml`, set `build-mode: native` and `runs-on: <your label>`.
+
+The runner clones the repo into its own `_work` folder and never touches your working
+copy, so the editor can stay open while CI builds. The first run is cold; later runs reuse
+that `Library/`.
+
+Upgrading the project's Unity version means installing that version through the Hub on the
+runner machine first. The editor is located via `unity-editor-path`, which defaults to
+`C:\Program Files\Unity\Hub\Editor\{version}\Editor\Unity.exe`.
+
 ## Refreshing the Unity licence
+
+Only relevant in `gameci` mode; `native` mode needs no licence secret at all.
 
 A Personal `.ulf` carries a timestamp that Unity's licensing service validates, and it
 goes stale. Exporting one from a developer machine also binds it to that machine, and
