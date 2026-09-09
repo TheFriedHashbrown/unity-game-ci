@@ -301,7 +301,10 @@ jobs:
         if: always()
         with:
           name: test-results-${{ inputs.game-id }}
-          path: ${{ steps.tests.outputs.artifactsPath }}
+          # The action errors with "Input required and not supplied: path" when this is
+          # empty, which happens whenever the test step dies before writing results, and
+          # that error then masks the real failure.
+          path: ${{ steps.tests.outputs.artifactsPath || 'test-results' }}
           retention-days: 14
           if-no-files-found: ignore
 
