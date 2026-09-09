@@ -99,6 +99,28 @@ filenames on every build, so marking them immutable under a rewritten prefix pin
 returning players to whichever build they loaded first, for a year, while `index.html`
 updates around them.
 
+## Refreshing the Unity licence
+
+A Personal `.ulf` carries a timestamp that Unity's licensing service validates, and it
+goes stale. Exporting one from a developer machine also binds it to that machine, and
+opening the editor locally can supersede it. When that happens the editor refuses to
+start and the job fails like this, with no Unity output and no test results:
+
+```
+[Licensing::Module] Loading manual activation license file UnityLicenseFile.ulf.
+[Licensing::Client] Error: Code 400 while processing request (status: TimeStamp validation failed)
+Unclassified error occured while trying to activate license.
+```
+
+From the outside this is a bare `exit code 1`, which looks like a broken test rather than
+a licensing problem. The give-away is the absence of any Unity output.
+
+To fix it: run the **Unity activation** workflow in the game repo, download the
+`unity-activation-file` artifact, upload the `.alf` at
+<https://license.unity3d.com/manual>, and paste the returned `.ulf` into `UNITY_LICENSE`.
+Generating the request inside CI rather than exporting from a machine is what keeps it
+valid.
+
 ## Running the pieces locally
 
 ```bash
@@ -126,7 +148,8 @@ ci/changelog.sh
 | `docker failed with exit code 125` | Docker could not start the container, usually disk. Free space on `/`; do not relocate Docker's data-root. |
 | `No space left on device` | WebGL and IL2CPP on a hosted runner. The prepare step frees ~25 GB and adds swap; past that use a self-hosted runner via `runs-on`. |
 | `The hosted runner lost communication with the server` | The runner process died: OOM killer during the WebGL link, or a full disk. Same fixes. |
-| `License is not activated` | Missing or expired Unity secrets, or a `.ulf` bound to a developer machine. |
+| `License is not activated` | Missing or expired Unity secrets. |
+| `TimeStamp validation failed`, then exit 1 with no Unity output at all | The `UNITY_LICENSE` `.ulf` has gone stale. Run the **Unity activation** workflow and refresh the secret. See below. |
 | PlayMode tests fail only in CI | CI runs `-nographics`; guard rendering-dependent assertions or move them to EditMode. |
 | Players stuck on an old build | A mutable prefix was cached immutably. Should not happen now, but a hard refresh clears it. |
 | First run is very slow | Cold `Library/` cache. Later runs on the same target reuse it. |
